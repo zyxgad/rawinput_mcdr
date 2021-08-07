@@ -253,7 +253,6 @@ class RawReader(io.RawIOBase):
 				self._writer.flush()
 			while not self._isend:
 				ch = self.__readchar()
-
 				if self._isend:
 					break
 				chid = ord(ch)
@@ -345,11 +344,8 @@ class RawReader(io.RawIOBase):
 		self._isend = True
 		self.unload_mixin()
 		if self._old_settings:
-			print('_old_settings:', self._old_settings)
 			termios.tcsetattr(self._reader_fd, termios.TCSADRAIN, self._old_settings)
-		print('with self._empty_lock:')
 		with self._empty_lock:
-			print('notify_all')
 			self._empty_lock.notify_all()
 
 
