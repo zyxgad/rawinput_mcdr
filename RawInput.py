@@ -183,9 +183,7 @@ class RawReader(io.RawIOBase):
 		self._check_end_or_interrupt()
 		if len(self._line_buffer) == 0:
 			with self._empty_lock:
-				print('wait line')
 				self._empty_lock.wait()
-				print('waited line')
 				self._check_end_or_interrupt()
 		return self._line_buffer.pop(0)
 
