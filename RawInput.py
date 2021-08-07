@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 
-IS_WIN32 = os.name == 'win32'
+IS_WIN32 = os.name == 'nt'
 
 if IS_WIN32:
 	import msvcrt
@@ -20,7 +20,7 @@ import mcdreforged.api.all as MCDR
 
 PLUGIN_METADATA = {
   'id': 'rawinput',
-  'version': '1.0.0',
+  'version': '1.0.1',
   'name': 'RawInput',
   'description': 'Minecraft better console!',
   'author': 'zyxgad',
@@ -77,9 +77,13 @@ class RawReader(io.RawIOBase):
 		self._mixin_map = {}
 		self._mixin = mixin
 		self._old_settings = None
-		self._empty_lock = threading.Condition(threading.Lock())
-		self._write_lock = threading.Lock()
-		self._line_buffer = []
+		self._buffer_lock = threading.RLock()
+		self._empty_lock = threading.Condition(self._buffer_lock)
+		self._write_lock = threading.RLock()
+		self._buffer = io.BytesIO()
+		self._histories = []
+		self.__line_his_buf = ''
+		self.__current_his = 0
 		self.__line_buf = []
 		self.__line_index = 0
 		assert reader.readable()
@@ -87,28 +91,29 @@ class RawReader(io.RawIOBase):
 		self._reader_fd = self._reader.fileno()
 		assert writer.writable()
 		self._writer = writer
-		self._old_settings = termios.tcgetattr(self._reader_fd)
-		try:
-			mode = termios.tcgetattr(self._reader_fd)
-			mode[tty.IFLAG] &= ~(termios.BRKINT | termios.INPCK | termios.IXON)
-			mode[tty.IFLAG] |= termios.ICRNL
-			mode[tty.OFLAG] |= termios.BSDLY
-			mode[tty.CFLAG] &= ~(termios.CSIZE | termios.PARENB)
-			mode[tty.CFLAG] |= termios.CS8
-			mode[tty.LFLAG] &= ~(termios.ICANON | termios.ECHO)
-			mode[tty.LFLAG] |= termios.ISIG
-			mode[tty.CC][termios.VMIN] = 1
-			mode[tty.CC][termios.VTIME] = 0
-			termios.tcsetattr(self._reader_fd, termios.TCSADRAIN, mode)
-			if self._mixin:
-				self.__mix(self._reader, 'read')
-				self.__mix(self._reader, 'readline')
-				self.__mix(self._reader, 'readlines')
-				self.__mix(self._writer, 'write')
-				self.__mix(self._writer, 'writelines')
-		except:
-			self.end()
-			raise
+		if not IS_WIN32:
+			self._old_settings = termios.tcgetattr(self._reader_fd)
+			try:
+				mode = termios.tcgetattr(self._reader_fd)
+				mode[tty.IFLAG] &= ~(termios.BRKINT | termios.INPCK | termios.IXON)
+				mode[tty.IFLAG] |= termios.ICRNL
+				mode[tty.OFLAG] |= termios.BSDLY
+				mode[tty.CFLAG] &= ~(termios.CSIZE | termios.PARENB)
+				mode[tty.CFLAG] |= termios.CS8
+				mode[tty.LFLAG] &= ~(termios.ICANON | termios.ECHO)
+				mode[tty.LFLAG] |= termios.ISIG
+				mode[tty.CC][termios.VMIN] = 1
+				mode[tty.CC][termios.VTIME] = 0
+				termios.tcsetattr(self._reader_fd, termios.TCSADRAIN, mode)
+			except:
+				self.end()
+				raise
+		if self._mixin:
+			self.__mix(self._reader, 'read')
+			self.__mix(self._reader, 'readline')
+			self.__mix(self._reader, 'readlines')
+			self.__mix(self._writer, 'write')
+			self.__mix(self._writer, 'writelines')
 		self._helper_thr = threading.Thread(target=self.__helper, name='raw-reader(r:{},w:{})'.
 			format(self._reader.fileno(), self._writer.fileno()))
 		self._helper_thr.setDaemon(True)
@@ -135,14 +140,21 @@ class RawReader(io.RawIOBase):
 			new = getattr(self, key)
 			if hasattr(obj, key):
 				old = getattr(obj, key)
-				if obj not in self._mixin_map:
-					self._mixin_map[obj] = {}
-				self._mixin_map[obj][key] = old
+				i = id(obj)
+				if i not in self._mixin_map:
+					self._mixin_map[i] = [obj, {}]
+				self._mixin_map[i][1][key] = old
 			setattr(obj, key, new)
 
+	def _get_mixin_attr(self, obj, key):
+		if self._mixin:
+			return self._mixin_map.get(id(obj), [None, {}])[1].get(key, getattr(obj, key))
+		return getattr(obj, key)
+
 	def unload_mixin(self):
-		for obj, mmap in self._mixin_map.items():
-			for key, old in mmap.items():
+		for _, mmap in self._mixin_map.items():
+			obj = mmap[0]
+			for key, old in mmap[1].items():
 				setattr(obj, key, old)
 
 	def _check_end_or_interrupt(self):
@@ -161,41 +173,37 @@ class RawReader(io.RawIOBase):
 	def seekable(self):
 		return False
 
-	def poll(self):
+	def _flush_empty_buf(self):
 		self._check_end_or_interrupt()
-		return None if len(self._line_buffer) == 0 else self._line_buffer.pop(0)
+		if self._buffer.tell() == len(self._buffer.getvalue()):
+			self._buffer = io.BytesIO()
+
+	def _wait_empty(self):
+		if self._buffer.tell() == len(self._buffer.getvalue()):
+			with self._empty_lock:
+				self._empty_lock.wait()
+				self._check_end_or_interrupt()
 
 	def read(self, size=-1):
-		try:
-			self._check_end_or_interrupt()
-			if len(self._line_buffer) == 0:
-				with self._empty_lock:
-					self._empty_lock.wait()
-					self._check_end_or_interrupt()
-			data = ''.join(self._line_buffer)
-			self._line_buffer.clear()
-			return data
-		except EOFError:
-			pass
-		return self.__read(size)
+		self._check_end_or_interrupt()
+		with self._buffer_lock:
+			self._flush_empty_buf()
+			self._wait_empty()
+			return self._buffer.read(size).decode('utf-8')
 
 	def readline(self, size=-1):
 		self._check_end_or_interrupt()
-		if len(self._line_buffer) == 0:
-			with self._empty_lock:
-				self._empty_lock.wait()
-				self._check_end_or_interrupt()
-		return self._line_buffer.pop(0)
+		with self._buffer_lock:
+			self._flush_empty_buf()
+			self._wait_empty()
+			return self._buffer.readline(size).decode('utf-8')
 
 	def readlines(self, hint=-1):
 		self._check_end_or_interrupt()
-		if len(self._line_buffer) == 0:
-			with self._empty_lock:
-				self._empty_lock.wait()
-				self._check_end_or_interrupt()
-		lines = self._line_buffer
-		self._line_buffer.clear()
-		return lines
+		with self._buffer_lock:
+			self._flush_empty_buf()
+			self._wait_empty()
+			return [l.decode('utf-8') for l in self._buffer.readlines(hint)]
 
 	def write(self, data):
 		self._check_end_or_interrupt()
@@ -233,16 +241,102 @@ class RawReader(io.RawIOBase):
 			return self.__read(1)
 
 	def __read(self, size=-1):
-		return (self._mixin_map[self._reader]['read'] if self._mixin else self._reader.read)(size)
+		return (self._get_mixin_attr(self._reader, 'read') if self._mixin else self._reader.read)(size)
 
 	def __readline(self, size=-1):
-		return (self._mixin_map[self._reader]['readline'] if self._mixin else self._reader.readline)(size)
+		return (self._get_mixin_attr(self._reader, 'readline') if self._mixin else self._reader.readline)(size)
 
 	def __readlines(self, hint=-1):
-		return (self._mixin_map[self._reader]['readlines'] if self._mixin else self._reader.readlines)(size)
+		return (self._get_mixin_attr(self._reader, 'readlines') if self._mixin else self._reader.readlines)(size)
 
 	def __write(self, data):
-		return (self._mixin_map[self._writer]['write'] if self._mixin else self._writer.write)(data)
+		return (self._get_mixin_attr(self._writer, 'write') if self._mixin else self._writer.write)(data)
+
+	def __helper_on_move_focus(self):
+		ch = self.__readchar()
+		chid = ord(ch)
+		if chid == MOVE_LEFT_ID:
+			if self.__line_index > 0:
+				self.__line_index -= 1
+				self.__write(MOVE_LEFT_CHAR)
+		elif chid == MOVE_RIGHT_ID:
+			if self.__line_index < len(self.__line_buf):
+				self.__line_index += 1
+				self.__write(MOVE_RIGHT_CHAR)
+		elif chid == MOVE_UP_ID:
+			self.__helper_last_history()
+		elif chid == MOVE_DOWN_ID:
+			self.__helper_next_history()
+
+	def __helper_change_line(self, new_line):
+		lline = len(self.__line_buf)
+		self.__write(MOVE_LEFT_CHAR * self.__line_index)
+		self.__write(' ' * lline)
+		self.__write(MOVE_LEFT_CHAR * lline)
+		self.__write(new_line)
+
+	def __helper_last_history(self):
+		if self.__current_his >= len(self._histories):
+			return
+		if self.__current_his == 0:
+			self.__line_his_buf = ''.join(self.__line_buf)
+		self.__current_his += 1
+		hist = self._histories[-self.__current_his]
+		self.__helper_change_line(hist)
+		self.__line_buf = list(hist)
+		self.__line_index = len(hist)
+
+	def __helper_next_history(self):
+		if self.__current_his <= 0:
+			return
+		self.__current_his -= 1
+		hist = self._histories[-self.__current_his] if self.__current_his > 0 else self.__line_his_buf
+		self.__helper_change_line(hist)
+		self.__line_buf = list(hist)
+		self.__line_index = len(hist)
+
+	def __helper_on_enter(self):
+		self.__write(os.linesep)
+		self.__write(self._prefix)
+		if len(self.__line_buf) > 0:
+			line = ''.join(self.__line_buf)
+			self.__line_buf.clear()
+			self.__line_index = 0
+			self._histories.append(line)
+			self.__current_his = 0
+			with self._empty_lock:
+				index = self._buffer.tell()
+				self._buffer.seek(0, os.SEEK_END)
+				self._buffer.write(line.encode('utf-8'))
+				self._buffer.write(os.linesep.encode('utf-8'))
+				self._buffer.seek(index, os.SEEK_SET)
+				self._empty_lock.notify()
+
+	def __helper_delete_char(self):
+		if self.__line_index == 0:
+			return
+		self.__line_index -= 1
+		self.__line_buf.pop(self.__line_index)
+		if self.__line_index < len(self.__line_buf):
+			tail = ''.join(self.__line_buf[self.__line_index:])
+			ltail = len(tail)
+			self.__write(MOVE_LEFT_CHAR)
+			self.__write(tail)
+			self.__write(' ')
+			self.__write(MOVE_LEFT_CHAR * (ltail + 1))
+		else:
+			self.__write(MOVE_LEFT_CHAR)
+			self.__write(' ')
+			self.__write(MOVE_LEFT_CHAR)
+
+	def __helper_insert_char(self, ch):
+		self.__line_buf.insert(self.__line_index, ch)
+		self.__line_index += 1
+		self.__write(ch)
+		if self.__line_index < len(self.__line_buf):
+			tail = ''.join(self.__line_buf[self.__line_index:])
+			self.__write(tail)
+			self.__write(MOVE_LEFT_CHAR * len(tail))
 
 	def __helper(self):
 		self.__line_buf.clear()
@@ -263,50 +357,15 @@ class RawReader(io.RawIOBase):
 						ch2 = self.__readchar()
 						chid2 = ord(ch2)
 						if chid2 == MOVE_ID:
-							ch3 = self.__readchar()
-							chid3 = ord(ch3)
-							if chid3 == MOVE_LEFT_ID:
-								if self.__line_index > 0:
-									self.__line_index -= 1
-									self.__write(MOVE_LEFT_CHAR)
-							elif chid3 == MOVE_RIGHT_ID:
-								if self.__line_index < len(self.__line_buf):
-									self.__line_index += 1
-									self.__write(MOVE_RIGHT_CHAR)
+							self.__helper_on_move_focus()
 					elif chid == BACKSPACE_ID:
-						if self.__line_index > 0:
-							self.__line_index -= 1
-							self.__line_buf.pop(self.__line_index)
-							if self.__line_index < len(self.__line_buf):
-								tail = ''.join(self.__line_buf[self.__line_index:])
-								ltail = len(tail)
-								self.__write(MOVE_LEFT_CHAR)
-								self.__write(tail)
-								self.__write(' ')
-								self.__write(MOVE_LEFT_CHAR * (ltail + 1))
-							else:
-								self.__write(MOVE_LEFT_CHAR)
-								self.__write(' ')
-								self.__write(MOVE_LEFT_CHAR)
+						self.__helper_delete_char()
 					elif chid == TAB_ID:
 						pass
 					elif ch == '\n':
-						self.__write(os.linesep)
-						self.__write(self._prefix)
-						if len(self.__line_buf) > 0:
-							with self._empty_lock:
-								self._line_buffer.append(''.join(self.__line_buf) + os.linesep)
-								self._empty_lock.notify()
-						self.__line_buf.clear()
-						self.__line_index = 0
+						self.__helper_on_enter()
 					elif ch.isprintable():
-						self.__line_buf.insert(self.__line_index, ch)
-						self.__line_index += 1
-						self.__write(ch)
-						if self.__line_index < len(self.__line_buf):
-							tail = ''.join(self.__line_buf[self.__line_index:])
-							self.__write(tail)
-							self.__write(MOVE_LEFT_CHAR * len(tail))
+						self.__helper_insert_char(ch)
 					self._writer.flush()
 		except OSError:
 			pass
@@ -343,8 +402,9 @@ class RawReader(io.RawIOBase):
 			return
 		self._isend = True
 		self.unload_mixin()
-		if self._old_settings:
-			termios.tcsetattr(self._reader_fd, termios.TCSADRAIN, self._old_settings)
+		if not IS_WIN32:
+			if self._old_settings:
+				termios.tcsetattr(self._reader_fd, termios.TCSADRAIN, self._old_settings)
 		with self._empty_lock:
 			self._empty_lock.notify_all()
 
