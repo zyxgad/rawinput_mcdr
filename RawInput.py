@@ -24,7 +24,7 @@ MCDR_MAIN_VERSION, MCDR_CHILD_VERSION = int(MCDR_MAIN_VERSION), int(MCDR_CHILD_V
 
 PLUGIN_METADATA = {
 	'id': 'rawinput',
-	'version': '1.1.0',
+	'version': '1.1.1',
 	'name': 'RawInput',
 	'description': 'Minecraft better console!',
 	'author': 'zyxgad',
@@ -245,13 +245,15 @@ class RawReader(io.RawIOBase):
 		with self._write_lock:
 			self._check_end_or_interrupt()
 			line = ''.join(self.__line_buf)
-			lline = len(self._prefix) + len(line)
-			self.__write(MOVE_LEFT_CHAR * (len(self._prefix) + self.__line_index))
+			linesize = str_weight(line)
+			linesize1 = str_weight(line[:self.__line_index])
+			lline = str_weight(self._prefix) + linesize
+			self.__write(MOVE_LEFT_CHAR * (len(self._prefix) + linesize1))
 			self.__write(' ' * lline)
 			self.__write(MOVE_LEFT_CHAR * lline)
 			self.__write(data)
 			self.__write(self._prefix); self.__write(line)
-			self.__write(MOVE_LEFT_CHAR * (len(line) - self.__line_index))
+			self.__write(MOVE_LEFT_CHAR * (linesize - linesize1))
 			self._writer.flush()
 
 	def writelines(self, lines):
@@ -259,14 +261,16 @@ class RawReader(io.RawIOBase):
 		with self._write_lock:
 			self._check_end_or_interrupt()
 			line = ''.join(self.__line_buf)
-			lline = len(line)
-			self.__write(MOVE_LEFT_CHAR * self.__line_index)
+			linesize = str_weight(line)
+			linesize1 = str_weight(line[:self.__line_index])
+			lline = str_weight(self._prefix) + linesize
+			self.__write(MOVE_LEFT_CHAR * (len(self._prefix) + linesize1))
 			self.__write(' ' * lline)
 			self.__write(MOVE_LEFT_CHAR * lline)
 			for data in lines:
 				self.__write(data)
 			self.__write(self._prefix); self.__write(line)
-			self.__write(MOVE_LEFT_CHAR * (lline - self.__line_index))
+			self.__write(MOVE_LEFT_CHAR * (linesize - linesize1))
 			self._writer.flush()
 
 	if IS_WIN32:
@@ -306,28 +310,24 @@ class RawReader(io.RawIOBase):
 	def __helper_on_move_focus_left(self):
 		if self.__line_index > 0:
 			self.__line_index -= 1
-			self.__write(MOVE_LEFT_CHAR)
+			self.__write(MOVE_LEFT_CHAR * char_weight(self.__line_buf[self.__line_index]))
 
-	if IS_WIN32:
-		def __helper_on_move_focus_right(self):
-			if self.__line_index < len(self.__line_buf):
-				self.__write(self.__line_buf[self.__line_index])
-				self.__line_index += 1
-	else:
-		def __helper_on_move_focus_right(self):
-			if self.__line_index < len(self.__line_buf):
-				self.__line_index += 1
-				self.__write(MOVE_RIGHT_CHAR)
+	def __helper_on_move_focus_right(self):
+		if self.__line_index < len(self.__line_buf):
+			self.__write(self.__line_buf[self.__line_index])
+			self.__line_index += 1
 
-	def __helper_change_line(self, new_line):
-		lline = len(self.__line_buf)
-		self.__write(MOVE_LEFT_CHAR * self.__line_index)
+	def __helper_change_line(self, new_content):
+		sline = ''.join(self.__line_buf)
+		lline = str_weight(sline)
+		self.__write(MOVE_LEFT_CHAR * str_weight(sline[:self.__line_index]))
 		self.__write(' ' * lline)
 		self.__write(MOVE_LEFT_CHAR * lline)
-		self.__write(new_line)
+		self.__write(new_content)
 
 	def __helper_last_history(self):
 		if self.__current_his >= len(self._histories):
+			self.__write(BELL_CHAR)
 			return
 		if self.__current_his == 0:
 			self.__line_his_buf = ''.join(self.__line_buf)
@@ -339,6 +339,7 @@ class RawReader(io.RawIOBase):
 
 	def __helper_next_history(self):
 		if self.__current_his <= 0:
+			self.__write(BELL_CHAR)
 			return
 		self.__current_his -= 1
 		hist = self._histories[-self.__current_his] if self.__current_his > 0 else self.__line_his_buf
@@ -374,20 +375,21 @@ class RawReader(io.RawIOBase):
 
 	def __helper_delete_char(self):
 		if self.__line_index == 0:
+			self.__write(BELL_CHAR)
 			return
 		self.__line_index -= 1
-		self.__line_buf.pop(self.__line_index)
+		csize = char_weight(self.__line_buf.pop(self.__line_index))
 		if self.__line_index < len(self.__line_buf):
 			tail = ''.join(self.__line_buf[self.__line_index:])
-			ltail = len(tail)
-			self.__write(MOVE_LEFT_CHAR)
+			ltail = str_weight(tail)
+			self.__write(MOVE_LEFT_CHAR * csize)
 			self.__write(tail)
-			self.__write(' ')
-			self.__write(MOVE_LEFT_CHAR * (ltail + 1))
+			self.__write(' ' * csize)
+			self.__write(MOVE_LEFT_CHAR * (ltail + csize))
 		else:
-			self.__write(MOVE_LEFT_CHAR)
-			self.__write(' ')
-			self.__write(MOVE_LEFT_CHAR)
+			self.__write(MOVE_LEFT_CHAR * csize)
+			self.__write(' ' * csize)
+			self.__write(MOVE_LEFT_CHAR * csize)
 
 	def __helper_insert_char(self, ch):
 		self.__line_buf.insert(self.__line_index, ch)
@@ -396,7 +398,7 @@ class RawReader(io.RawIOBase):
 		if self.__line_index < len(self.__line_buf):
 			tail = ''.join(self.__line_buf[self.__line_index:])
 			self.__write(tail)
-			self.__write(MOVE_LEFT_CHAR * len(tail))
+			self.__write(MOVE_LEFT_CHAR * str_weight(tail))
 
 	def __helper(self):
 		self.__line_buf.clear()
@@ -404,11 +406,11 @@ class RawReader(io.RawIOBase):
 		try:
 			with self._write_lock:
 				self.__write(self._prefix)
+			while True:
 				self._writer.flush()
-			while not self.__isclose:
+				if self.__isclose: break
 				ch = self.__readchar()
-				if self.__isclose:
-					break
+				if self.__isclose: break
 				chid = ord(ch)
 				# print('chid:', hex(chid))
 				if chid == BREAK_ID:
@@ -428,15 +430,18 @@ class RawReader(io.RawIOBase):
 					elif chid == TAB_ID:
 						self.__helper_next_guest()
 					else:
-						try:
-							if isinstance(ch, bytes): ch = try_decodes(ch, ['utf-8', 'gbk'])
-						except UnicodeDecodeError:
-							continue
+						if isinstance(ch, bytes):
+							try:
+								ch = try_decodes(ch, ['utf-8', 'gbk'])
+							except UnicodeDecodeError:
+								self.__write(BELL_CHAR)
+								continue
 						if ch == '\r' or ch == '\n':
 							self.__helper_on_enter()
 						elif ch.isprintable():
 							self.__helper_insert_char(ch)
-					self._writer.flush()
+						else:
+							self.__write(BELL_CHAR)
 		except OSError:
 			pass
 		finally:
@@ -478,6 +483,23 @@ class RawReader(io.RawIOBase):
 	def __del__(self):
 		if self.__pid == os.getpid():
 			self.close()
+
+def char_weight(ch):
+	csize = 0
+	ch = ord(ch)
+	while ch != 0:
+		csize += 1
+		ch >>= 8
+	return csize
+
+def str_weight(string):
+	csize = 0
+	for c in string:
+		ch = ord(c)
+		while ch != 0:
+			csize += 1
+			ch >>= 8
+	return csize
 
 def try_decodes(string, encodes):
 	for e in encodes:
