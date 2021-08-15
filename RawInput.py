@@ -9,26 +9,34 @@ IS_WIN32 = os.name == 'nt'
 
 if IS_WIN32:
 	import msvcrt
+	from ctypes import c_ulong, pointer, windll
+	from ctypes.wintypes import DWORD, HANDLE
+	STD_INPUT_HANDLE = c_ulong(-10)
 else:
 	import tty
 	import termios
 
 import mcdreforged.api.all as MCDR
+from mcdreforged import __version__ as MCDR_VERSION
+MCDR_MAIN_VERSION, MCDR_CHILD_VERSION, MCDR_PATCH_VERSION = MCDR_VERSION.split('.', 2)
+MCDR_MAIN_VERSION, MCDR_CHILD_VERSION = int(MCDR_MAIN_VERSION), int(MCDR_CHILD_VERSION)
+
 
 PLUGIN_METADATA = {
-  'id': 'rawinput',
-  'version': '1.0.2',
-  'name': 'RawInput',
-  'description': 'Minecraft better console!',
-  'author': 'zyxgad',
-  'link': 'https://github.com/zyxgad/rawinput_mcdr',
-  'dependencies': {
-    'mcdreforged': '>=1.0.0'
-  }
+	'id': 'rawinput',
+	'version': '1.1.0',
+	'name': 'RawInput',
+	'description': 'Minecraft better console!',
+	'author': 'zyxgad',
+	'link': 'https://github.com/zyxgad/rawinput_mcdr',
+	'dependencies': {
+		'mcdreforged': '>=1.0.0'
+	}
 }
 
 default_config = {
-	'prefix': '>'
+	'prefix': '>',
+	'enable': True
 }
 config = default_config.copy()
 
@@ -38,32 +46,46 @@ SERVER_OBJ = None
 read_write = None
 
 def send_message(source: MCDR.CommandSource, *args, sep=' ', prefix=MSG_ID):
-  if source is not None:
-    source.reply(MCDR.RTextList(prefix, args[0], *([MCDR.RTextList(sep, a) for a in args][1:])))
+	if source is not None:
+		source.reply(MCDR.RTextList(prefix, args[0], *([MCDR.RTextList(sep, a) for a in args][1:])))
 
 def broadcast_message(*args, sep=' ', prefix=MSG_ID):
-  if SERVER_OBJ is not None:
-    SERVER_OBJ.broadcast(MCDR.RTextList(prefix, args[0], *([MCDR.RTextList(sep, a) for a in args][1:])))
+	if SERVER_OBJ is not None:
+		SERVER_OBJ.broadcast(MCDR.RTextList(prefix, args[0], *([MCDR.RTextList(sep, a) for a in args][1:])))
 
 def log_info(*args, sep=' ', prefix=MSG_ID):
-  if SERVER_OBJ is not None:
-    SERVER_OBJ.logger.info(MCDR.RTextList(prefix, args[0], *([MCDR.RTextList(sep, a) for a in args][1:])))
+	if SERVER_OBJ is not None:
+		SERVER_OBJ.logger.info(MCDR.RTextList(prefix, args[0], *([MCDR.RTextList(sep, a) for a in args][1:])))
 
 
 #####################################
 BREAK_ID = 0x03
+BACKSPACE_ID = 0x08
 TAB_ID = 0x09
 NEW_LINE_ID = 0x0d
 ESC_ID = 0x1b
-MOVE_ID = 0x5b
-MOVE_UP_ID = 0x41
-MOVE_DOWN_ID = 0x42
-MOVE_RIGHT_ID = 0x43
-MOVE_LEFT_ID = 0x44
-BACKSPACE_ID = 0x7f
+if IS_WIN32:
+	MOVE_ID = 0xe0
+	MOVE_UP_ID = 0x48
+	MOVE_DOWN_ID = 0x50
+	MOVE_RIGHT_ID = 0x4d
+	MOVE_LEFT_ID = 0x4b
+else:
+	MOVE_ID = 0x5b
+	MOVE_UP_ID = 0x41
+	MOVE_DOWN_ID = 0x42
+	MOVE_RIGHT_ID = 0x43
+	MOVE_LEFT_ID = 0x44
+	SHIFT_TAB_ID = 0x5a
+DELETE_ID = 0x7f
 
-MOVE_RIGHT_CHAR = '\x1b\x5b\x43'
-MOVE_LEFT_CHAR = '\x1b\x5b\x44'
+if IS_WIN32:
+	BELL_CHAR = '\x07'
+	MOVE_LEFT_CHAR = '\x08'
+else:
+	BELL_CHAR = '\x07'
+	MOVE_RIGHT_CHAR = '\x1b\x5b\x43'
+	MOVE_LEFT_CHAR = '\x1b\x5b\x44'
 #####################################
 
 class RawReader(io.RawIOBase):
@@ -85,20 +107,31 @@ class RawReader(io.RawIOBase):
 		self.__current_his = 0
 		self.__line_buf = []
 		self.__line_index = 0
-		assert reader.readable() and reader.isatty(), "输入流必须是(伪)终端设备"
+		assert reader.readable(), "Input stream can not be read"
+		assert reader.isatty(), "The input stream must be a tty"
 		self._reader = reader
 		self._reader_fd = self._reader.fileno()
-		assert writer.writable()
+		assert writer.writable(), "Output stream can not be write"
 		self._writer = writer
-		if not IS_WIN32:
+		if IS_WIN32:
+			self.__handle = HANDLE(windll.kernel32.GetStdHandle(STD_INPUT_HANDLE))
+			original_mode = DWORD()
+			windll.kernel32.GetConsoleMode(self.__handle, pointer(original_mode))
+			self.__original_mode = original_mode
+			ENABLE_ECHO_INPUT = 0x0004
+			ENABLE_LINE_INPUT = 0x0002
+			ENABLE_PROCESSED_INPUT = 0x0001
+			windll.kernel32.SetConsoleMode(
+				self.__handle,
+				self.__original_mode.value & ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT)
+			)
+		else:
 			self.__old_settings = termios.tcgetattr(self._reader_fd)
 			try:
 				mode = termios.tcgetattr(self._reader_fd)
-				mode[tty.IFLAG] &= ~(termios.BRKINT | termios.INPCK | termios.IXON)
+				mode[tty.IFLAG] &= ~(termios.BRKINT | termios.INPCK | termios.IXON | termios.IXOFF | termios.INLCR | termios.IGNCR)
 				mode[tty.IFLAG] |= termios.ICRNL
-				mode[tty.CFLAG] &= ~(termios.CSIZE | termios.PARENB)
-				mode[tty.CFLAG] |= termios.CS8
-				mode[tty.LFLAG] &= ~(termios.ICANON | termios.ECHO | termios.ISIG)
+				mode[tty.LFLAG] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)
 				mode[tty.CC][termios.VMIN] = 1
 				mode[tty.CC][termios.VTIME] = 0
 				termios.tcsetattr(self._reader_fd, termios.TCSADRAIN, mode)
@@ -258,18 +291,33 @@ class RawReader(io.RawIOBase):
 	def __helper_on_move_focus(self):
 		ch = self.__readchar()
 		chid = ord(ch)
+		# print('mv chid:', hex(chid))
 		if chid == MOVE_LEFT_ID:
-			if self.__line_index > 0:
-				self.__line_index -= 1
-				self.__write(MOVE_LEFT_CHAR)
+			self.__helper_on_move_focus_left()
 		elif chid == MOVE_RIGHT_ID:
-			if self.__line_index < len(self.__line_buf):
-				self.__line_index += 1
-				self.__write(MOVE_RIGHT_CHAR)
+			self.__helper_on_move_focus_right()
 		elif chid == MOVE_UP_ID:
 			self.__helper_last_history()
 		elif chid == MOVE_DOWN_ID:
 			self.__helper_next_history()
+		elif not IS_WIN32 and chid == SHIFT_TAB_ID:
+			self.__helper_last_guest()
+
+	def __helper_on_move_focus_left(self):
+		if self.__line_index > 0:
+			self.__line_index -= 1
+			self.__write(MOVE_LEFT_CHAR)
+
+	if IS_WIN32:
+		def __helper_on_move_focus_right(self):
+			if self.__line_index < len(self.__line_buf):
+				self.__write(self.__line_buf[self.__line_index])
+				self.__line_index += 1
+	else:
+		def __helper_on_move_focus_right(self):
+			if self.__line_index < len(self.__line_buf):
+				self.__line_index += 1
+				self.__write(MOVE_RIGHT_CHAR)
 
 	def __helper_change_line(self, new_line):
 		lline = len(self.__line_buf)
@@ -297,6 +345,14 @@ class RawReader(io.RawIOBase):
 		self.__helper_change_line(hist)
 		self.__line_buf = list(hist)
 		self.__line_index = len(hist)
+
+	def __helper_next_guest(self):
+		# TODO
+		self.__write(BELL_CHAR)
+
+	def __helper_last_guest(self):
+		# TODO
+		self.__write(BELL_CHAR)
 
 	def __helper_on_enter(self):
 		self.__write(os.linesep)
@@ -354,24 +410,32 @@ class RawReader(io.RawIOBase):
 				if self.__isclose:
 					break
 				chid = ord(ch)
+				# print('chid:', hex(chid))
 				if chid == BREAK_ID:
 					self.__isinterrupt = True
 					break
-				if isinstance(ch, bytes): ch = try_decodes(ch, ['utf-8', 'gbk'])
 				with self._write_lock:
 					if chid == ESC_ID:
 						ch2 = self.__readchar()
 						chid2 = ord(ch2)
+						# print('esc chid:', hex(chid2))
 						if chid2 == MOVE_ID:
 							self.__helper_on_move_focus()
-					elif chid == BACKSPACE_ID:
+					elif IS_WIN32 and chid == MOVE_ID:
+						self.__helper_on_move_focus()
+					elif chid == BACKSPACE_ID or chid == DELETE_ID:
 						self.__helper_delete_char()
 					elif chid == TAB_ID:
-						pass
-					elif ch == '\r' or ch == '\n':
-						self.__helper_on_enter()
-					elif ch.isprintable():
-						self.__helper_insert_char(ch)
+						self.__helper_next_guest()
+					else:
+						try:
+							if isinstance(ch, bytes): ch = try_decodes(ch, ['utf-8', 'gbk'])
+						except UnicodeDecodeError:
+							continue
+						if ch == '\r' or ch == '\n':
+							self.__helper_on_enter()
+						elif ch.isprintable():
+							self.__helper_insert_char(ch)
 					self._writer.flush()
 		except OSError:
 			pass
@@ -402,9 +466,10 @@ class RawReader(io.RawIOBase):
 			return
 		self.__isclose = True
 		self.unload_mixin()
-		if self.__old_settings is not None:
+		if IS_WIN32:
+			windll.kernel32.SetConsoleMode(self.__handle, self.__original_mode)
+		else:
 			termios.tcsetattr(self._reader_fd, termios.TCSADRAIN, self.__old_settings)
-			self.__old_settings = None
 		with self._empty_lock:
 			self._empty_lock.notify_all()
 		if self.__helper_thr is not None:
@@ -424,34 +489,67 @@ def try_decodes(string, encodes):
 
 ######### Mixins #########
 
-def _mixin_ConsoleHandler_tick():
-	from mcdreforged.executor.console_handler import ConsoleHandler
-	from mcdreforged.info import Info
-	from mcdreforged.utils.logger import DebugOption, SyncStreamHandler
-	def tick(self):
-		try:
-			text = input()
-			parsed_result: Info
+if MCDR_MAIN_VERSION == 1:
+	def _mixin_ConsoleHandler_tick():
+		from mcdreforged.executor.console_handler import ConsoleHandler
+		from mcdreforged.info import Info
+		from mcdreforged.utils.logger import DebugOption
+		def tick(self):
 			try:
-				parsed_result = self.mcdr_server.server_handler_manager.get_current_handler().parse_console_command(text)
+				text = input()
+				parsed_result: Info
+				try:
+					parsed_result = self.mcdr_server.server_handler_manager.get_current_handler().parse_console_command(text)
+				except:
+					self.mcdr_server.logger.exception(self.mcdr_server.tr('console_handler.parse_fail', text))
+				else:
+					if self.mcdr_server.logger.should_log_debug(DebugOption.HANDLER):
+						self.mcdr_server.logger.debug('Parsed text from {}:'.format(type(self).__name__), no_check=True)
+						for line in parsed_result.format_text().splitlines():
+							self.mcdr_server.logger.debug('    {}'.format(line), no_check=True)
+					self.mcdr_server.reactor_manager.put_info(parsed_result)
+			except KeyboardInterrupt:
+				if self.mcdr_server.is_server_running() and not self.mcdr_server.is_interrupt():
+					self.mcdr_server.interrupt()
+			except (EOFError, SystemExit, IOError) as error:
+				if self.mcdr_server.is_server_running():
+					self.mcdr_server.logger.critical('Critical exception caught in {}: {} {}'.format(type(self).__name__, type(error).__name__, error))
+					self.mcdr_server.interrupt()
 			except:
-				self.mcdr_server.logger.exception(self.mcdr_server.tr('console_handler.parse_fail', text))
-			else:
-				if self.mcdr_server.logger.should_log_debug(DebugOption.HANDLER):
-					self.mcdr_server.logger.debug('Parsed text from {}:'.format(type(self).__name__), no_check=True)
-					for line in parsed_result.format_text().splitlines():
-						self.mcdr_server.logger.debug('    {}'.format(line), no_check=True)
-				self.mcdr_server.reactor_manager.put_info(parsed_result)
-		except KeyboardInterrupt:
-			if self.mcdr_server.is_server_running() and not self.mcdr_server.is_interrupt():
-				self.mcdr_server.interrupt()
-		except (EOFError, SystemExit, IOError) as error:
-			if self.mcdr_server.is_server_running():
-				self.mcdr_server.logger.critical('Critical exception caught in {}: {} {}'.format(type(self).__name__, type(error).__name__, error))
-				self.mcdr_server.interrupt()
-		except:
-			self.mcdr_server.logger.exception(self.mcdr_server.tr('console_handler.error'))
-	ConsoleHandler.tick = tick
+				self.mcdr_server.logger.exception(self.mcdr_server.tr('console_handler.error'))
+		ConsoleHandler.tick = tick
+elif MCDR_MAIN_VERSION == 2:
+	def _mixin_ConsoleHandler_tick():
+		from mcdreforged.executor.console_handler import ConsoleHandler
+		from mcdreforged.info import Info
+		from mcdreforged.utils.logger import DebugOption
+		def tick(self):
+			try:
+				text = self.console_kit.get_input()
+				if not isinstance(text, str):
+					raise IOError()
+				try:
+					parsed_result: Info = self.mcdr_server.server_handler_manager.get_current_handler().parse_console_command(text)
+				except:
+					self.mcdr_server.logger.exception(self.mcdr_server.tr('console_handler.parse_fail', text))
+				else:
+					if self.mcdr_server.logger.should_log_debug(DebugOption.HANDLER):
+						self.mcdr_server.logger.debug('Parsed text from {}:'.format(type(self).__name__), no_check=True)
+						for line in parsed_result.format_text().splitlines():
+							self.mcdr_server.logger.debug('	{}'.format(line), no_check=True)
+					self.mcdr_server.reactor_manager.put_info(parsed_result)
+			except KeyboardInterrupt:
+				if self.mcdr_server.is_server_running() and not self.mcdr_server.is_interrupt():
+					self.mcdr_server.interrupt()
+			except (EOFError, SystemExit, IOError) as error:
+				if self.mcdr_server.is_server_running():
+					self.mcdr_server.logger.critical('Critical exception caught in {}: {} {}'.format(type(self).__name__, type(error).__name__, error))
+					if not self.mcdr_server.interrupt():  # not first try
+						self.mcdr_server.logger.error('Console thread stopped')
+						self.stop()
+			except:
+				self.mcdr_server.logger.exception(self.mcdr_server.tr('console_handler.error'))
+		ConsoleHandler.tick = tick
 
 def _mixin_InfoReactorManager_put_info():
 	from mcdreforged.info_reactor.info_reactor_manager import InfoReactorManager
@@ -497,39 +595,23 @@ def on_load(server :MCDR.ServerInterface, prev_module):
 			# 	prev_module.read_write.reader.close()
 			# prev_module.read_write = None
 
-	if read_write is None:
+	log_info('MCDReforged version', MCDR_VERSION, '(Main={})'.format(MCDR_MAIN_VERSION))
+	if MCDR_MAIN_VERSION == 2:
+		log_info('advanced_console:', server._mcdr_server.config['advanced_console'])
+		if config['enable'] and server._mcdr_server.config['advanced_console']:
+			config['enable'] = False
+			server.logger.warning("RawInput needn't enable when advanced_console is using")
+			server.logger.warning("So `enable` set to `false` now.")
+
+	if read_write is None and config['enable']:
 		sys_stdin = sys.stdin
 		try:
+			sys.stderr = sys.stdout
 			sys.stdin = read_write = RawReader(os.fdopen(sys_stdin.fileno(), 'r'), sys.stdout, config['prefix'], mixin=True)
-		except AssertionError:
-			server.logger.error('The input stream are not atty')
+		except AssertionError as e:
+			server.logger.error(str(e))
 		else:
 			sys_stdin.close()
-
-#####!!!!!Has some bug
-# def on_unload(server :MCDR.ServerInterface):
-# 	global SERVER_OBJ, read_write
-# 	log_info('RawInput is on unload')
-# 	if read_write is not None:
-# 		if not read_write.closed:
-# 			sys.stdin = open(read_write.reader.fileno(), 'r')
-# 			read_write.close()
-# 			read_write.reader.close()
-# 		read_write = None
-# 	if SERVER_OBJ is not None:
-# 		SERVER_OBJ = None
-
-# def on_remove(server :MCDR.ServerInterface):
-# 	global SERVER_OBJ, read_write
-# 	log_info('RawInput is on remove')
-# 	if read_write is not None:
-# 		if not read_write.closed:
-# 			sys.stdin = open(read_write.reader.fileno(), 'r')
-# 			read_write.close()
-# 			read_write.reader.close()
-# 		read_write = None
-# 	if SERVER_OBJ is not None:
-# 		SERVER_OBJ = None
 
 def on_mcdr_stop(server :MCDR.ServerInterface):
 	global SERVER_OBJ, read_write
@@ -537,7 +619,7 @@ def on_mcdr_stop(server :MCDR.ServerInterface):
 	if read_write is not None:
 		if not read_write.closed:
 			read_write.close()
-			threading.Thread(target=lambda: os.close(read_write.reader.fileno()), daemon=True).start() # I don't know why it can be blocked
+			threading.Thread(target=lambda: os.close(read_write.reader.fileno()), daemon=True).start()
 		read_write = None
 	log_info('closed')
 	if SERVER_OBJ is not None:
